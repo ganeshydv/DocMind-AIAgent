@@ -1,0 +1,8 @@
+node_modules/
+
+qdrant_storage/*
+redis_data/*
+uploads/*
+
+secret.txt
+.env

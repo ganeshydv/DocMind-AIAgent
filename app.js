@@ -1,20 +1,21 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const fs = require("fs");
 const { v4: uuidv4 } = require("uuid");
+const { fork } = require("child_process");
+const path = require("path")
 
-const { extractText } = require("./services/pdf");
-const { chunkText, cleanText } = require("./services/chunk");
 const { createEmbedding } = require("./services/embedding");
-const { ensureCollection, insertVectors, search, deleteDocument, listDocuments } = require("./services/vector");
+const {
+  search,
+  deleteDocument,
+  listDocuments,
+} = require("./services/vector");
 const { generateStream } = require("./services/llm");
 const {
   initUpload,
   saveChunk,
   getUploadStatus,
-  assembleFile,
-  updateProcessingStatus,
   getProcessingStatus,
 } = require("./services/upload");
 
@@ -32,7 +33,9 @@ app.post("/upload/init", async (req, res) => {
   try {
     const { userId, fileName, fileSize, totalChunks } = req.body;
     if (!userId || !fileName || !totalChunks) {
-      return res.status(400).json({ error: "userId, fileName, totalChunks required" });
+      return res
+        .status(400)
+        .json({ error: "userId, fileName, totalChunks required" });
     }
     const uploadId = uuidv4();
     await initUpload(uploadId, { userId, fileName, fileSize, totalChunks });
@@ -58,8 +61,21 @@ app.post("/upload/chunk/:uploadId/:chunkIndex", async (req, res) => {
 
       const status = await getUploadStatus(uploadId);
       if (status.complete) {
-        // All chunks received → kick off background processing
-        processUpload(uploadId, status.userId).catch(console.error);
+        // Fork a child process for heavy processing (text extraction + embedding).
+        // Using fork() instead of Worker because @xenova/transformers native ONNX
+        // bindings crash the main process when a worker thread exits.
+        const child = fork(
+          path.join(__dirname, "services", "process-worker.js"),
+          [uploadId, status.userId],
+        );
+        child.on("message", (msg) => console.log(`[Process] ${msg.stage}`));
+        child.on("error", (err) =>
+          console.error("[Process] Error:", err.message),
+        );
+        child.on("exit", (code) =>
+          console.log(`[Process] Exited with code ${code}`),
+        );
+        child.unref();
       }
       res.json({ received: true, chunkIndex: parseInt(chunkIndex) });
     });
@@ -109,69 +125,6 @@ app.get("/upload/status/:uploadId", async (req, res) => {
   req.on("close", () => clearInterval(interval));
 });
 
-// ─── Background Document Processing ────────────────────────────
-
-const BATCH_SIZE = 5; // embed this many chunks in parallel
-
-async function processUpload(uploadId, userId) {
-  try {
-    // Step 1: Reassemble file from chunks
-    await updateProcessingStatus(uploadId, { stage: "assembling", progress: 0 });
-    const filePath = await assembleFile(uploadId);
-
-    // Step 2: Extract text from document (PDF, DOCX, TXT, etc.)
-    await updateProcessingStatus(uploadId, { stage: "extracting", progress: 0 });
-    const text = await extractText(filePath);
-    const cleanedText = cleanText(text);
-
-    // Step 3: Split into overlapping text chunks
-    await updateProcessingStatus(uploadId, { stage: "chunking", progress: 0 });
-    const textChunks = chunkText(cleanedText);
-    const total = textChunks.length;
-
-    // Step 4: Ensure user's collection exists
-    await ensureCollection(userId);
-
-    // Get the original fileName for metadata
-    const uploadData = await require("./services/redis").hgetall(`upload:${uploadId}`);
-    const fileName = uploadData.fileName || uploadId;
-    // Use uploadId as the docId — unique per upload
-    const docId = uploadId;
-
-    // Store docId in Redis so frontend can reference it later
-    await require("./services/redis").hset(`upload:${uploadId}`, "docId", docId);
-
-    // Step 5: Embed & insert in parallel batches
-    for (let i = 0; i < textChunks.length; i += BATCH_SIZE) {
-      const batch = textChunks.slice(i, i + BATCH_SIZE);
-
-      // Parallel embedding within the batch
-      const embeddings = await Promise.all(batch.map((c) => createEmbedding(c)));
-
-      const points = batch.map((chunk, j) => ({
-        id: uuidv4(),
-        vector: embeddings[j],
-        payload: { text: chunk, docId, fileName },
-      }));
-
-      await insertVectors(userId, points);
-
-      await updateProcessingStatus(uploadId, {
-        stage: "embedding",
-        progress: Math.min(i + BATCH_SIZE, total),
-        total,
-      });
-    }
-
-    await updateProcessingStatus(uploadId, { stage: "complete", progress: total, total });
-
-    // Cleanup the assembled file
-    fs.unlinkSync(filePath);
-  } catch (err) {
-    console.error("Processing error:", err);
-    await updateProcessingStatus(uploadId, { stage: "error", error: err.message });
-  }
-}
 
 // ─── Document Management ───────────────────────────────────────
 
@@ -208,7 +161,8 @@ app.delete("/docs/:userId/:docId", async (req, res) => {
  */
 app.get("/models/ollama", async (_req, res) => {
   try {
-    const ollamaUrl = process.env.OLLAMA_URL || "http://localhost:11434/api/generate";
+    const ollamaUrl =
+      process.env.OLLAMA_URL || "http://localhost:11434/api/generate";
     const baseUrl = ollamaUrl.replace(/\/api\/generate$/, "");
     const response = await require("axios").get(`${baseUrl}/api/tags`);
     const models = (response.data.models || []).map((m) => ({
@@ -261,7 +215,9 @@ app.post("/ask", async (req, res) => {
     if (history && history.length > 0) {
       conversationHistory = history
         .slice(-10)
-        .map((msg) => `${msg.role === "user" ? "User" : "Assistant"}: ${msg.text}`)
+        .map(
+          (msg) => `${msg.role === "user" ? "User" : "Assistant"}: ${msg.text}`,
+        )
         .join("\n");
       conversationHistory = `\n\nConversation so far:\n${conversationHistory}`;
     }
@@ -273,7 +229,11 @@ app.post("/ask", async (req, res) => {
     sendStage("thinking");
 
     let firstToken = true;
-    for await (const token of generateStream(prompt, { provider: selectedProvider, model, history })) {
+    for await (const token of generateStream(prompt, {
+      provider: selectedProvider,
+      model,
+      history,
+    })) {
       if (firstToken) {
         sendStage("streaming");
         firstToken = false;

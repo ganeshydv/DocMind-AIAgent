@@ -402,46 +402,139 @@ Worker Thread 2: [████ User B embed ████]  ← parallel!
 
 Streaming happens on the **main thread** (I/O only). Worker threads handle CPU-heavy embedding in the background. The event loop stays responsive for all `res.write()` calls.
 
-### Implementation example:
+---
 
-**Worker file** (`services/embedding-worker.js`):
-```javascript
-const { parentPort } = require("worker_threads");
-const { pipeline } = require("@xenova/transformers");
+### ⚠️ Issue We Hit: `worker_threads` + `@xenova/transformers` Crashes Node.js
 
-let embedder;
+**What happened:**
 
-parentPort.on("message", async (text) => {
-  if (!embedder) {
-    embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
-  }
-  const output = await embedder(text, { pooling: "mean", normalize: true });
-  parentPort.postMessage(Array.from(output.data));
-});
+We moved the `processUpload` pipeline (text extraction → chunking → embedding → vector insert)
+into a `worker_threads` Worker. The processing completed successfully, but **the main Express
+server crashed** every time the worker exited.
+
+**Symptoms:**
+```
+$ node app.js
+Server running on port 3000
+Redis connected
+Redis connected          ← worker's own Redis connection
+[Worker] complete        ← worker finished successfully
+                         ← server DIES here (exit code 5)
 ```
 
-**Main thread** (`services/embedding.js`):
-```javascript
-const { Worker } = require("worker_threads");
-const worker = new Worker("./services/embedding-worker.js");
+**Root cause:**
 
-function createEmbedding(text) {
-  return new Promise((resolve) => {
-    worker.once("message", resolve);
-    worker.postMessage(text);
+`@xenova/transformers` uses ONNX Runtime with **native C++/WASM bindings**. Worker threads share
+the same OS process memory. When the worker thread exits, those native bindings tear down and
+**corrupt shared memory**, killing the entire Node.js process.
+
+```
+┌─────────────────────────────────────────────┐
+│           Node.js Process (single)          │
+│                                             │
+│  Main Thread          Worker Thread         │
+│  ┌─────────┐         ┌──────────────┐      │
+│  │ Express │         │ @xenova ONNX │      │
+│  │ server  │         │ native WASM  │      │
+│  └─────────┘         └──────┬───────┘      │
+│                              │              │
+│                     Worker exits...         │
+│                              │              │
+│                   ONNX tears down           │
+│                   SHARED memory  ← 💥       │
+│                              │              │
+│              ENTIRE PROCESS CRASHES          │
+└─────────────────────────────────────────────┘
+```
+
+**What we tried (didn't work):**
+
+1. `process.exit(0)` in worker → kills entire process (not just worker)
+2. Removing `process.exit()`, letting worker exit naturally → native handles keep worker alive or corrupt on teardown
+3. `parentPort.close()` + `worker.unref()` → still crashes
+4. `redis.quit()` before exit → Redis closes fine, but ONNX native teardown still kills process
+
+**The fix: `child_process.fork()`**
+
+Switched from `worker_threads` to `child_process.fork()`. A forked child process runs in a
+**completely separate OS process** with its own V8 instance and memory space. Nothing it does
+can affect the main server.
+
+```
+┌──────────────────────┐      ┌──────────────────────┐
+│  Main Process (PID 1)│      │ Child Process (PID 2) │
+│  ┌─────────┐         │ IPC  │  ┌──────────────┐    │
+│  │ Express │ ◄──────────────── │ @xenova ONNX │    │
+│  │ server  │         │      │  │ native WASM  │    │
+│  └─────────┘         │      │  └──────────────┘    │
+│                      │      │                      │
+│  Server stays alive  │      │  Process exits →     │
+│  no matter what ✅   │      │  OS cleans up ✅     │
+└──────────────────────┘      └──────────────────────┘
+```
+
+**Implementation:**
+
+Main thread (`app.js`):
+```javascript
+const { fork } = require("child_process");
+
+// When all chunks are uploaded:
+const child = fork(
+  path.join(__dirname, "services", "process-worker.js"),
+  [uploadId, userId],               // passed as process.argv[2], [3]
+);
+child.on("message", (msg) => console.log(`[Process] ${msg.stage}`));
+child.on("error", (err) => console.error("[Process] Error:", err.message));
+child.on("exit", (code) => console.log(`[Process] Exited with code ${code}`));
+child.unref();   // don't keep main alive waiting for child
+```
+
+Child process (`services/process-worker.js`):
+```javascript
+require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
+// ... all service requires ...
+
+const [uploadId, userId] = process.argv.slice(2);
+
+processUpload(uploadId, userId)
+  .then(async () => {
+    if (process.send) process.send({ stage: "complete" });
+    await redis.quit();
+  })
+  .catch(async (err) => {
+    if (process.send) process.send({ stage: "error", error: err.message });
+    await redis.quit();
   });
-}
 ```
 
-### When to use worker threads:
+### Worker Threads vs Child Process — Comparison
 
-| Scenario | Concurrent Users | Need Workers? |
+| | `worker_threads` | `child_process.fork()` |
 |---|---|---|
-| Single user, small docs | 1 | No |
-| Few users, occasional uploads | 2-5 | Optional |
-| Many concurrent uploads (embedding phase) | 5+ | **Yes** |
-| Many users asking questions simultaneously | 10+ | **Yes** |
-| Only streaming LLM responses | Any | No — pure I/O |
+| **Memory** | Shared with main | Separate OS process |
+| **Native crash** | **Kills main server** | Dies alone, server safe |
+| **Communication** | `parentPort` / `workerData` | `process.send()` / `process.argv` |
+| **Overhead** | Low (~2MB) | Medium (~30MB, new V8 instance) |
+| **Module cache** | Separate (good) | Separate (good) |
+| **Best for** | Pure JS CPU work (crypto, parsing) | **Native bindings** (ONNX, sharp, canvas) |
+| **Our choice** | ❌ Crashes with @xenova | ✅ Stable |
+
+### Key takeaway
+
+> **Use `worker_threads` for pure JavaScript CPU work. Use `child_process.fork()` when the
+> code uses native C++/WASM bindings** (like `@xenova/transformers`, `sharp`, `canvas`,
+> `better-sqlite3`). Native bindings can corrupt shared memory when a worker thread exits.
+
+### When to use which:
+
+| Scenario | Concurrent Users | Approach |
+|---|---|---|
+| Single user, small docs | 1 | Inline (no offloading) |
+| Few users, occasional uploads | 2-5 | `fork()` for processing |
+| Many concurrent uploads | 5+ | **`fork()` with pool** |
+| Only streaming LLM responses | Any | No offloading — pure I/O |
+| Pure JS computation (no native) | Any | `worker_threads` is fine |
 
 ---
 

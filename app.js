@@ -201,13 +201,36 @@ app.delete("/docs/:userId/:docId", async (req, res) => {
   }
 });
 
+// ─── Ollama Models ─────────────────────────────────────────────
+
+/**
+ * List locally available Ollama models.
+ */
+app.get("/models/ollama", async (_req, res) => {
+  try {
+    const ollamaUrl = process.env.OLLAMA_URL || "http://localhost:11434/api/generate";
+    const baseUrl = ollamaUrl.replace(/\/api\/generate$/, "");
+    const response = await require("axios").get(`${baseUrl}/api/tags`);
+    const models = (response.data.models || []).map((m) => ({
+      name: m.name,
+      size: m.size,
+      family: m.details?.family,
+      parameterSize: m.details?.parameter_size,
+    }));
+    res.json({ models });
+  } catch (err) {
+    console.error("Ollama models error:", err.message);
+    res.json({ models: [], error: "Ollama not reachable" });
+  }
+});
+
 // ─── Ask Question (Streaming SSE) ──────────────────────────────
 
 /**
  * Streams the LLM answer token-by-token via SSE.
  */
 app.post("/ask", async (req, res) => {
-  const { userId, question, history, provider, docId } = req.body;
+  const { userId, question, history, provider, model, docId } = req.body;
   if (!userId || !question) {
     return res.status(400).json({ error: "userId and question required" });
   }
@@ -215,10 +238,22 @@ app.post("/ask", async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // disable proxy buffering (nginx, etc.)
+  res.flushHeaders(); // send headers immediately — establishes the SSE connection
+
+  const sendStage = (stage) => {
+    res.write(`data: ${JSON.stringify({ stage })}\n\n`);
+    if (typeof res.flush === "function") res.flush();
+  };
 
   try {
+    sendStage("analyzing");
     const queryEmbedding = await createEmbedding(question);
+
+    sendStage("searching");
     const results = await search(userId, queryEmbedding, docId || null);
+
+    sendStage("referencing");
     const context = results.map((r) => r.payload.text).join("\n");
 
     // Build conversation history string
@@ -235,8 +270,16 @@ app.post("/ask", async (req, res) => {
 
     const selectedProvider = provider || process.env.LLM_PROVIDER || "ollama";
 
-    for await (const token of generateStream(prompt, { provider: selectedProvider, history })) {
+    sendStage("thinking");
+
+    let firstToken = true;
+    for await (const token of generateStream(prompt, { provider: selectedProvider, model, history })) {
+      if (firstToken) {
+        sendStage("streaming");
+        firstToken = false;
+      }
       res.write(`data: ${JSON.stringify({ token })}\n\n`);
+      if (typeof res.flush === "function") res.flush(); // force TCP push per token
     }
 
     res.write(`data: ${JSON.stringify({ done: true })}\n\n`);

@@ -3,12 +3,12 @@ const axios = require("axios");
 // ─── Ollama (local) ─────────────────────────────────────────────
 
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434/api/generate";
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3.2:3b";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3";
 
-async function* ollamaStream(prompt) {
+async function* ollamaStream(prompt, model) {
   const res = await axios.post(
     OLLAMA_URL,
-    { model: OLLAMA_MODEL, prompt, stream: true },
+    { model: model || OLLAMA_MODEL, prompt, stream: true },
     { responseType: "stream" }
   );
 
@@ -98,13 +98,14 @@ async function* gatewayStream(prompt, history) {
  * @param {string} prompt - Full prompt with context
  * @param {object} options
  * @param {string} options.provider - "ollama" or "gateway"
+ * @param {string} options.model    - Ollama model name (e.g. "llama3", "mistral")
  * @param {Array}  options.history  - Chat history for gateway
  */
-async function* generateStream(prompt, { provider = "ollama", history = [] } = {}) {
+async function* generateStream(prompt, { provider = "ollama", model, history = [] } = {}) {
   if (provider === "gateway" && GATEWAY_KEY) {
     yield* gatewayStream(prompt, history);
   } else {
-    yield* ollamaStream(prompt);
+    yield* ollamaStream(prompt, model);
   }
 }
 

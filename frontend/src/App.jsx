@@ -22,8 +22,11 @@ function App() {
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
   const [isAsking, setIsAsking] = useState(false);
+  const [askStage, setAskStage] = useState(""); // analyzing | searching | referencing | thinking | streaming
   const [chatHistory, setChatHistory] = useState([]);
   const [provider, setProvider] = useState("gateway"); // "ollama" or "gateway"
+  const [ollamaModels, setOllamaModels] = useState([]);
+  const [selectedModel, setSelectedModel] = useState(""); // "" = use server default
 
   const fileInputRef = useRef();
 
@@ -46,6 +49,22 @@ function App() {
   useEffect(() => {
     if (isUserSet && userId) fetchDocs();
   }, [isUserSet]);
+
+  // Fetch available Ollama models when provider is ollama
+  useEffect(() => {
+    if (provider === "ollama") {
+      fetch(`${API}/models/ollama`)
+        .then((r) => r.json())
+        .then((data) => {
+          setOllamaModels(data.models || []);
+          // Auto-select first model if none selected
+          if (!selectedModel && data.models?.length > 0) {
+            setSelectedModel(data.models[0].name);
+          }
+        })
+        .catch(() => setOllamaModels([]));
+    }
+  }, [provider]);
 
   const handleDeleteDoc = async (docId) => {
     if (!confirm("Delete this document and all its vectors?")) return;
@@ -151,6 +170,7 @@ function App() {
     setQuestion("");
     setIsAsking(true);
     setAnswer("");
+    setAskStage("analyzing");
 
     // Add user message to history
     const updatedHistory = [...chatHistory, { role: "user", text: q }];
@@ -168,6 +188,7 @@ function App() {
           userId,
           question: q,
           provider,
+          model: provider === "ollama" ? selectedModel || undefined : undefined,
           docId: selectedDocId || undefined, // filter to specific doc or search all
           history: updatedHistory.slice(-10), // last 10 messages for context
         }),
@@ -189,9 +210,14 @@ function App() {
           if (line.startsWith("data: ")) {
             try {
               const data = JSON.parse(line.slice(6));
+              if (data.stage) {
+                setAskStage(data.stage);
+              }
               if (data.token) {
                 fullAnswer += data.token;
+                // Use a microtask yield to let the browser paint each token
                 setAnswer(fullAnswer);
+                await new Promise((r) => setTimeout(r, 0));
               }
               if (data.error) {
                 fullAnswer += `\n\nError: ${data.error}`;
@@ -216,6 +242,7 @@ function App() {
         ]);
       }
       setIsAsking(false);
+      setAskStage("");
     }
   };
 
@@ -280,6 +307,19 @@ function App() {
               ☁️ Gateway
             </button>
           </div>
+          {provider === "ollama" && ollamaModels.length > 0 && (
+            <select
+              className="model-select"
+              value={selectedModel}
+              onChange={(e) => setSelectedModel(e.target.value)}
+            >
+              {ollamaModels.map((m) => (
+                <option key={m.name} value={m.name}>
+                  {m.name} {m.parameterSize ? `(${m.parameterSize})` : ""}
+                </option>
+              ))}
+            </select>
+          )}
           <span className="user-badge">👤 {userId}</span>
         </div>
       </div>
@@ -385,6 +425,32 @@ function App() {
                 <p>{msg.text}</p>
               </div>
             ))}
+          </div>
+        )}
+
+        {isAsking && askStage && (
+          <div className="ask-pipeline">
+            {["analyzing", "searching", "referencing", "thinking", "streaming"].map((s) => {
+              const stages = ["analyzing", "searching", "referencing", "thinking", "streaming"];
+              const currentIdx = stages.indexOf(askStage);
+              const thisIdx = stages.indexOf(s);
+              const status = thisIdx < currentIdx ? "done" : thisIdx === currentIdx ? "active" : "pending";
+              const labels = {
+                analyzing: "Analyzing",
+                searching: "Collection",
+                referencing: "Reference",
+                thinking: "Thinking",
+                streaming: "Responding",
+              };
+              return (
+                <div key={s} className={`stage-step ${status}`}>
+                  <div className="stage-dot">
+                    {status === "done" ? "✓" : status === "active" ? "●" : "○"}
+                  </div>
+                  <span className="stage-label">{labels[s]}</span>
+                </div>
+              );
+            })}
           </div>
         )}
 

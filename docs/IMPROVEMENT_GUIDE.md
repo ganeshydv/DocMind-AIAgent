@@ -17,6 +17,7 @@ A practical guide to improving response quality, search accuracy, performance, a
 - [9. Chat Memory & History](#9-chat-memory--history)
 - [10. Performance & Scalability](#10-performance--scalability)
 - [11. Security Improvements](#11-security-improvements)
+- [12. Node.js Concurrency & Streaming Deep Dive](#12-nodejs-concurrency--streaming-deep-dive)
 - [Priority Roadmap](#priority-roadmap)
 
 ---
@@ -376,6 +377,127 @@ async function getCachedEmbedding(text) {
 | **CORS wide open** | `cors()` allows all origins | Restrict to frontend origin |
 
 **Impact:** Critical for production deployment.
+
+---
+
+## 12. Node.js Concurrency & Streaming Deep Dive
+
+### "Node.js is single-threaded — does streaming block other users?"
+
+**No.** Node.js is single-threaded but **not single-task**. It uses an event loop with non-blocking I/O. Streaming is pure I/O — it never blocks.
+
+### How SSE Streaming Works Internally
+
+```javascript
+for await (const token of generateStream(prompt)) {
+  res.write(`data: ${JSON.stringify({ token })}\n\n`);  // ~0.001ms CPU work
+  // Then Node YIELDS back to the event loop, waiting for next token from LLM
+}
+```
+
+Each `await` in the `for await` loop **releases the thread** back to the event loop. While waiting for the next token from Ollama/Gateway (network I/O), Node handles other requests freely.
+
+### Multi-User Timeline Example
+
+```
+Time    Event Loop Activity
+─────   ──────────────────────────────────────────────────
+0ms     User A: /ask received → createEmbedding() [CPU BUSY ~50ms]
+50ms    User A: embedding done → Qdrant search [I/O, thread FREE]
+51ms    User B: /ask received → createEmbedding() [CPU BUSY ~50ms]
+52ms    User A: Qdrant results back → send to LLM [I/O, thread FREE]
+55ms    User A: token 1 arrives → res.write() → thread FREE
+56ms    User C: /ask received (queued until CPU available)
+58ms    User A: token 2 arrives → res.write() → thread FREE
+101ms   User B: embedding done → Qdrant search [I/O, thread FREE]
+102ms   User C: createEmbedding() [CPU BUSY ~50ms]
+103ms   User B: Qdrant results → send to LLM [I/O, thread FREE]
+...     All 3 users streaming tokens interleaved — nobody blocked
+```
+
+10 users streaming simultaneously? No problem — it's all network I/O interleaved on the event loop.
+
+### What Actually Blocks the Event Loop
+
+| Operation | Type | Blocks? | Duration |
+|---|---|---|---|
+| `createEmbedding()` | **CPU** (transformer model inference) | **Yes** | ~50-200ms per chunk |
+| `res.write()` (SSE streaming) | I/O | No | ~0.001ms |
+| Qdrant search (HTTP) | I/O | No | Awaited |
+| LLM token streaming (HTTP) | I/O | No | Awaited |
+| Redis get/set | I/O | No | Awaited |
+| PDF text extraction | **CPU** | **Yes** | Brief |
+| `fs.readFileSync()` | **CPU** (sync I/O) | **Yes** | Brief |
+
+**Key insight:** Only `createEmbedding()` is a meaningful bottleneck. Everything else is non-blocking I/O.
+
+### Worker Threads — When and Why
+
+Worker threads move CPU-heavy work off the main thread so it doesn't block other requests.
+
+**Without worker threads (current):**
+```
+Main Thread: User A embedding [████████] User B embedding [████████] ...
+             (User B waits 50-200ms until A's embedding finishes)
+```
+
+**With worker threads:**
+```
+Main Thread:     User A req → dispatch → FREE → User B req → dispatch → FREE → streaming...
+Worker Thread 1: [████ User A embedding ████]
+Worker Thread 2: [████ User B embedding ████]  (parallel, no blocking)
+```
+
+**Does it affect streaming?** No — streaming happens on the main thread (I/O only, `res.write()` takes microseconds). Worker threads handle CPU-heavy embedding off the main thread, making the event loop **more responsive** for streaming.
+
+### Implementation: Embedding Worker
+
+```javascript
+// services/embedding-worker.js — runs in a worker thread
+const { parentPort } = require("worker_threads");
+const { pipeline } = require("@xenova/transformers");
+
+let embedder;
+
+parentPort.on("message", async (text) => {
+  if (!embedder) {
+    embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+  }
+  const output = await embedder(text, { pooling: "mean", normalize: true });
+  parentPort.postMessage(Array.from(output.data));
+});
+```
+
+```javascript
+// services/embedding.js — main thread dispatches to worker
+const { Worker } = require("worker_threads");
+const worker = new Worker("./services/embedding-worker.js");
+
+function createEmbedding(text) {
+  return new Promise((resolve) => {
+    worker.once("message", resolve);
+    worker.postMessage(text);
+  });
+}
+```
+
+### When to Use Worker Threads
+
+| Scenario | Users | Need Workers? |
+|---|---|---|
+| Single user, small docs | 1 | No |
+| Few users, occasional uploads | 2-5 | Optional |
+| Many concurrent uploads | 5+ | **Yes** — embedding blocks the loop |
+| Many users asking questions | 10+ | **Yes** — query embedding blocks briefly |
+| Just streaming LLM responses | Any | No — pure I/O, never blocks |
+
+### Summary
+
+- **Streaming never blocks** — each `await` yields to the event loop
+- **10+ users can stream simultaneously** — it's all interleaved I/O
+- **`createEmbedding()` is the only real bottleneck** — ~50-200ms of CPU per call
+- **Worker threads fix the bottleneck** without affecting streaming
+- **No need for clustering** unless you exceed one CPU core's capacity for embeddings
 
 ---
 

@@ -13,6 +13,9 @@
   - [Chunking Strategies](#chunking-strategies)
 - [Vector Search — How Qdrant Finds Answers](#vector-search--how-qdrant-finds-answers)
 - [The Full Picture](#the-full-picture)
+- [Text Cleaning Before Embedding](#text-cleaning-before-embedding)
+- [Chunk Size vs Embedding Dimensions — A Common Misconception](#chunk-size-vs-embedding-dimensions--a-common-misconception)
+- [How Chunk Size Shapes Response Accuracy](#how-chunk-size-shapes-response-accuracy)
 
 ---
 
@@ -395,3 +398,208 @@ vectors: { size: 384, distance: "Cosine" }
 4. **Overlap prevents information loss** at chunk boundaries (20% is a good default)
 5. **Per-user collections** ensure complete data isolation
 6. **Cosine similarity** is the standard choice for text search
+
+---
+
+## Text Cleaning Before Embedding
+
+Raw text from PDFs, DOCX, and other formats often contains noise that degrades embedding quality. The embedding model wastes attention on meaningless tokens instead of the actual content.
+
+### Why Clean?
+
+| Noise Type | Example | Problem |
+|-----------|---------|---------|
+| Extra whitespace | `"Hello     world"` | Wastes tokens on spaces |
+| Repeated newlines | `"\n\n\n\n\n"` | Empty tokens dilute the embedding |
+| Control characters | `\x00`, `\x0B` | Invisible garbage the model can't interpret |
+| PDF artifacts | Page numbers, headers/footers repeated on every page | Pollutes every chunk with the same irrelevant info |
+| Unicode replacement chars | `\ufffd` | Failed encoding conversions |
+
+### Recommended Preprocessing
+
+```javascript
+function cleanText(text) {
+  return text
+    .replace(/\r\n/g, '\n')                           // normalize line endings
+    .replace(/\n{3,}/g, '\n\n')                        // collapse 3+ newlines → 2
+    .replace(/[ \t]{2,}/g, ' ')                        // collapse multiple spaces/tabs
+    .replace(/[^\S\n]+/g, ' ')                         // normalize whitespace (keep newlines)
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')    // remove control chars
+    .trim();
+}
+```
+
+**Important:** Do NOT remove all spaces or strip punctuation — the model needs natural language structure (sentence boundaries, commas, periods) to understand meaning correctly.
+
+### Before vs After Cleaning
+
+```
+BEFORE (raw PDF extract):
+"   \n\n\n\nPage 3\n\n   The patient was    prescribed   metformin\x00 500mg\n\n\n\n\n"
+
+AFTER (cleaned):
+"Page 3\n\nThe patient was prescribed metformin 500mg"
+```
+
+The cleaned version produces a significantly better embedding because every token carries actual meaning.
+
+---
+
+## Chunk Size vs Embedding Dimensions — A Common Misconception
+
+These two concepts are **completely independent**:
+
+| Concept | What It Is | Value in Our App |
+|---------|-----------|-----------------|
+| **Chunk size** (500 chars) | How much **text input** you feed into the model | Variable — you choose it |
+| **Embedding dimensions** (384) | The **vector output** size — fixed by model architecture | Fixed — set by the model |
+
+### How the Model Works Internally
+
+The embedding model is a neural network that takes text of **any length** and **always** outputs a **384-dimensional vector**:
+
+```
+Input: "Hello world" (11 chars, ~3 tokens)
+  ↓ tokenize
+  [CLS] Hello world [SEP]          → 4 tokens
+  ↓ 6 transformer layers
+  4 token vectors, each 384-dim    → shape: [4, 384]
+  ↓ mean pooling (average across tokens)
+  1 vector, 384-dim                → shape: [384]
+  ↓ normalize
+  Output: [0.023, -0.156, ..., 0.089]   (always 384 numbers)
+
+Input: "The patient was prescribed metformin..." (500 chars, ~100 tokens)
+  ↓ tokenize
+  100 tokens                       → 100 tokens
+  ↓ 6 transformer layers
+  100 token vectors, each 384-dim  → shape: [100, 384]
+  ↓ mean pooling
+  1 vector, 384-dim                → shape: [384]
+  ↓ normalize
+  Output: [0.112, -0.034, ..., 0.201]   (always 384 numbers)
+```
+
+The 384 dimensions of the vector collection in Qdrant must match the model's output — but they have **nothing to do with** how much text you feed in.
+
+### Token Limit Matters, Not Char Count
+
+`all-MiniLM-L6-v2` has a **max token limit of 256 tokens** (~1000–1200 characters). Text beyond this is **silently truncated** — the model simply ignores the rest.
+
+```
+"A 2000-character paragraph..."
+  ↓ tokenize → 400 tokens
+  ↓ TRUNCATED to 256 tokens (~first 1200 chars)
+  ↓ rest is silently lost
+```
+
+Our 500-char chunks produce ~80–120 tokens — safely within the 256-token limit.
+
+---
+
+## How Chunk Size Shapes Response Accuracy
+
+Chunk size directly impacts **retrieval precision**, **context quality**, and ultimately **LLM answer accuracy**.
+
+### Scenario: Medical Document
+
+```
+Full text: "The patient was diagnosed with type 2 diabetes in 2021.
+Prescribed metformin 500mg twice daily. Blood glucose improved from
+180 to 120 mg/dL over 3 months. Patient also has allergies to
+penicillin. Family history includes heart disease. Regular exercise
+program recommended — 30 min walking daily."
+```
+
+### Too Small (100 chars)
+
+```
+Chunk 1: "The patient was diagnosed with type 2 diabetes in 2021. Prescribed metformin 500mg twi"
+Chunk 2: "ce daily. Blood glucose improved from 180 to 120 mg/dL over 3 months. Patient also ha"
+Chunk 3: "s allergies to penicillin. Family history includes heart disease. Regular exercise pro"
+```
+
+- **Embedding**: Very specific, narrow meaning per chunk
+- **Search**: High precision — finds exact keyword matches
+- **Problem**: Sentence split mid-word ("twi" / "ce daily"), context lost
+- **LLM gets**: Fragmented snippets, can't form coherent answers
+- **Result**: Accurate retrieval but **poor, incomplete answers**
+
+### Too Large (2000 chars)
+
+```
+Chunk 1: [entire document as one chunk]
+```
+
+- **Embedding**: Diluted — diabetes, allergies, family history, exercise all compressed into 384 dims
+- **Search**: Matches broadly but **less precisely** — the metformin signal is drowned by allergy/exercise info
+- **LLM gets**: Lots of context but much of it irrelevant to the question
+- **Result**: **Noisy retrieval**, LLM may hallucinate from unrelated content in the chunk
+
+### Sweet Spot (500 chars — our setting)
+
+```
+Chunk 1: "The patient was diagnosed with type 2 diabetes in 2021. Prescribed metformin 500mg
+          twice daily. Blood glucose improved from 180 to 120 mg/dL over 3 months."
+Chunk 2: "Patient also has allergies to penicillin. Family history includes heart disease.
+          Regular exercise program recommended — 30 min walking daily."
+```
+
+- **Embedding**: Each chunk captures a **coherent semantic unit** (treatment vs. history)
+- **Search**: Precise enough to match "what medication?" → Chunk 1, broad enough to include dosage + results
+- **LLM gets**: Focused, relevant passages
+- **Result**: **Best balance** of precision and context
+
+### How 384 Dimensions Encode 500 Characters
+
+When the model compresses 500 chars into 384 numbers, it distributes meaning across all dimensions. Conceptually:
+
+```
+500-char chunk about diabetes medication
+  ↓ tokenize → ~100 tokens
+  ↓ 6 transformer layers (attention mechanism)
+  ↓ mean pool all token vectors → 384 dims
+  ↓
+384-dim vector — meaning distributed across ALL dimensions:
+  • Some dimensions activate for "medical" domain
+  • Some dimensions activate for "medication/treatment" topic
+  • Some dimensions encode "diabetes" specifics
+  • Some dimensions capture "dosage + outcome" relationships
+  • Remaining dimensions encode nuance, tone, context
+```
+
+> **Note:** Dimensions aren't actually this cleanly separated — meaning is distributed across all 384 dims. But the visualization helps understand how a fixed-size vector can capture variable-length text.
+
+### The Overlap Factor
+
+Our 100-char overlap (20% of chunk size) ensures key sentences spanning chunk boundaries appear in both chunks:
+
+```
+Chunk 1: "...diagnosed with type 2 diabetes. Prescribed metformin 500mg"  ← overlap zone →
+Chunk 2: "Prescribed metformin 500mg twice daily. Blood glucose improved..."
+```
+
+Without overlap, the connection between "diabetes diagnosis" and "metformin prescription" could be lost if the boundary falls between them.
+
+### Chunk Size Decision Matrix
+
+| Chunk Size | Tokens (~) | Precision | Context | Best For |
+|-----------|-----------|-----------|---------|----------|
+| 100–200 chars | 20–50 | ★★★★★ | ★☆☆☆☆ | FAQ, definitions, short facts |
+| 300–500 chars | 60–120 | ★★★★☆ | ★★★☆☆ | **General purpose RAG (our choice)** |
+| 500–800 chars | 100–200 | ★★★☆☆ | ★★★★☆ | Narrative text, legal docs |
+| 1000+ chars | 200+ | ★★☆☆☆ | ★★★★★ | Long-form analysis (⚠️ may hit token limit) |
+
+### Our Current Settings
+
+```javascript
+// services/chunk.js
+function chunkText(text, size = 500, overlap = 100) { ... }
+```
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| Size | 500 chars | Within 256-token limit, captures coherent ideas |
+| Overlap | 100 chars (20%) | Prevents boundary information loss |
+| Model max tokens | 256 | 500 chars ≈ 100 tokens — safely within limit |
+| Output dims | 384 | Fixed by all-MiniLM-L6-v2 architecture |

@@ -5,7 +5,7 @@ const fs = require("fs");
 const { v4: uuidv4 } = require("uuid");
 
 const { extractText } = require("./services/pdf");
-const { chunkText } = require("./services/chunk");
+const { chunkText, cleanText } = require("./services/chunk");
 const { createEmbedding } = require("./services/embedding");
 const { ensureCollection, insertVectors, search, deleteDocument, listDocuments } = require("./services/vector");
 const { generateStream } = require("./services/llm");
@@ -122,10 +122,11 @@ async function processUpload(uploadId, userId) {
     // Step 2: Extract text from document (PDF, DOCX, TXT, etc.)
     await updateProcessingStatus(uploadId, { stage: "extracting", progress: 0 });
     const text = await extractText(filePath);
+    const cleanedText = cleanText(text);
 
     // Step 3: Split into overlapping text chunks
     await updateProcessingStatus(uploadId, { stage: "chunking", progress: 0 });
-    const textChunks = chunkText(text);
+    const textChunks = chunkText(cleanedText);
     const total = textChunks.length;
 
     // Step 4: Ensure user's collection exists

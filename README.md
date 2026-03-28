@@ -235,3 +235,6 @@ npm run dev
 ## 📝 License
 
 ISC
+
+
+3. if want to scale this app for more user what is best appraoch give analysis in details for 10k users then 100k user then 1M users then 100M users then 1B users DAU like this create one md file also mention how this can slow down our system what approach should be used at different levels from users to server to giving response  all include system design think like a architect experienced and give detaild analysis for this

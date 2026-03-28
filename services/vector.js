@@ -1,6 +1,34 @@
 const axios = require("axios");
+const http = require("http");
 
 const BASE_URL = "http://localhost:6333";
+
+// Create a dedicated axios instance with keep-alive to prevent ECONNRESET
+// on idle TCP sockets (common with Docker containers on Windows).
+const qdrant = axios.create({
+  baseURL: BASE_URL,
+  httpAgent: new http.Agent({ keepAlive: true, keepAliveMsecs: 30000 }),
+  timeout: 30000,
+});
+
+/**
+ * Retry wrapper for transient network errors (ECONNRESET, ECONNREFUSED, etc.)
+ */
+async function withRetry(fn, retries = 3, delay = 500) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isTransient = err.code === "ECONNRESET" || err.code === "ECONNREFUSED" || err.code === "ETIMEDOUT";
+      if (isTransient && i < retries - 1) {
+        console.warn(`Qdrant connection error (${err.code}), retrying in ${delay}ms... (${i + 1}/${retries})`);
+        await new Promise((r) => setTimeout(r, delay));
+      } else {
+        throw err;
+      }
+    }
+  }
+}
 
 /**
  * Each user gets their own collection: docs_<userId>
@@ -13,30 +41,32 @@ function getCollectionName(userId) {
 
 async function ensureCollection(userId) {
   const collection = getCollectionName(userId);
-  try {
-    await axios.get(`${BASE_URL}/collections/${collection}`);
-  } catch (err) {
-    if (err.response && err.response.status === 404) {
-      await axios.put(`${BASE_URL}/collections/${collection}`, {
-        vectors: { size: 384, distance: "Cosine" },
-      });
-      // Create payload index on docId for fast filtered searches
-      await axios.put(
-        `${BASE_URL}/collections/${collection}/index`,
-        { field_name: "docId", field_schema: "keyword" }
-      );
-    } else {
-      throw err;
+  await withRetry(async () => {
+    try {
+      await qdrant.get(`/collections/${collection}`);
+    } catch (err) {
+      if (err.response && err.response.status === 404) {
+        await qdrant.put(`/collections/${collection}`, {
+          vectors: { size: 384, distance: "Cosine" },
+        });
+        // Create payload index on docId for fast filtered searches
+        await qdrant.put(
+          `/collections/${collection}/index`,
+          { field_name: "docId", field_schema: "keyword" }
+        );
+      } else {
+        throw err;
+      }
     }
-  }
+  });
 }
 
 async function insertVectors(userId, points) {
   const collection = getCollectionName(userId);
   await ensureCollection(userId);
-  await axios.put(`${BASE_URL}/collections/${collection}/points`, {
-    points,
-  });
+  await withRetry(() =>
+    qdrant.put(`/collections/${collection}/points`, { points })
+  );
 }
 
 /**
@@ -59,16 +89,18 @@ async function search(userId, vector, docId = null) {
     };
   }
 
-  try {
-    const res = await axios.post(
-      `${BASE_URL}/collections/${collection}/points/query`,
-      body
-    );
-    return res.data.result.points || res.data.result;
-  } catch (err) {
-    console.error("Qdrant search error:", err.response?.data || err.message);
-    throw err;
-  }
+  return withRetry(async () => {
+    try {
+      const res = await qdrant.post(
+        `/collections/${collection}/points/query`,
+        body
+      );
+      return res.data.result.points || res.data.result;
+    } catch (err) {
+      console.error("Qdrant search error:", err.response?.data || err.message);
+      throw err;
+    }
+  });
 }
 
 /**
@@ -76,11 +108,13 @@ async function search(userId, vector, docId = null) {
  */
 async function deleteDocument(userId, docId) {
   const collection = getCollectionName(userId);
-  await axios.post(`${BASE_URL}/collections/${collection}/points/delete`, {
-    filter: {
-      must: [{ key: "docId", match: { value: docId } }],
-    },
-  });
+  await withRetry(() =>
+    qdrant.post(`/collections/${collection}/points/delete`, {
+      filter: {
+        must: [{ key: "docId", match: { value: docId } }],
+      },
+    })
+  );
 }
 
 /**
@@ -89,17 +123,18 @@ async function deleteDocument(userId, docId) {
  */
 async function listDocuments(userId) {
   const collection = getCollectionName(userId);
-  try {
-    const res = await axios.post(
-      `${BASE_URL}/collections/${collection}/points/scroll`,
-      {
-        limit: 1000,
-        with_payload: { include: ["docId", "fileName"] },
-      }
-    );
-    const points = res.data.result.points || [];
-    const docsMap = new Map();
-    for (const p of points) {
+  return withRetry(async () => {
+    try {
+      const res = await qdrant.post(
+        `/collections/${collection}/points/scroll`,
+        {
+          limit: 1000,
+          with_payload: { include: ["docId", "fileName"] },
+        }
+      );
+      const points = res.data.result.points || [];
+      const docsMap = new Map();
+      for (const p of points) {
       const { docId, fileName } = p.payload;
       if (docId && !docsMap.has(docId)) {
         docsMap.set(docId, fileName || docId);
@@ -110,6 +145,7 @@ async function listDocuments(userId) {
     if (err.response && err.response.status === 404) return [];
     throw err;
   }
+  });
 }
 
 module.exports = {

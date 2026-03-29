@@ -18,6 +18,7 @@ A practical guide to improving response quality, search accuracy, performance, a
 - [10. Performance & Scalability](#10-performance--scalability)
 - [11. Security Improvements](#11-security-improvements)
 - [12. Node.js Concurrency & Streaming Deep Dive](#12-nodejs-concurrency--streaming-deep-dive)
+- [13. Process Pool Architecture (Implemented)](#13-process-pool-architecture-implemented)
 - [Priority Roadmap](#priority-roadmap)
 
 ---
@@ -340,7 +341,7 @@ const history = messages.map(JSON.parse);
 |---|---|---|
 | **Embedding speed** | Sequential batch of 5 | Increase batch size to 10-20 |
 | **Model loading** | First request loads the model (~5s) | Warm up on server start |
-| **Single process** | Node.js single-threaded | Use worker threads for CPU-intensive embedding |
+| **Single process** | Node.js single-threaded | ✅ **Done** — Process pool for CPU-intensive embedding (see [§13](#13-process-pool-architecture-implemented)) |
 | **No caching** | Same question re-embeds every time | Cache query embeddings in Redis |
 
 ### Recommended: Warm Up & Cache
@@ -431,73 +432,219 @@ Time    Event Loop Activity
 
 **Key insight:** Only `createEmbedding()` is a meaningful bottleneck. Everything else is non-blocking I/O.
 
-### Worker Threads — When and Why
+### Worker Threads vs. Child Processes — When and Why
 
-Worker threads move CPU-heavy work off the main thread so it doesn't block other requests.
+CPU-heavy work (ONNX model inference, PDF parsing) blocks the Node.js event loop. There are two ways to offload it:
 
-**Without worker threads (current):**
+| Approach | Isolation | Overhead | Crash Safety |
+|---|---|---|---|
+| `worker_threads` | Shared memory (lightweight) | Low (~5MB per thread) | ❌ Native bindings can crash the main process |
+| `child_process.fork()` | Full process isolation | High (~50-100MB per process) | ✅ Child crash doesn't affect the main process |
+
+**Why we use `fork()` instead of `worker_threads`:**
+`@xenova/transformers` uses native ONNX bindings. When a worker thread using these bindings exits, it can crash the entire main process. `fork()` gives full process isolation — a child crash is harmless.
+
+**Without process pool (old):**
 ```
-Main Thread: User A embedding [████████] User B embedding [████████] ...
-             (User B waits 50-200ms until A's embedding finishes)
-```
-
-**With worker threads:**
-```
-Main Thread:     User A req → dispatch → FREE → User B req → dispatch → FREE → streaming...
-Worker Thread 1: [████ User A embedding ████]
-Worker Thread 2: [████ User B embedding ████]  (parallel, no blocking)
-```
-
-**Does it affect streaming?** No — streaming happens on the main thread (I/O only, `res.write()` takes microseconds). Worker threads handle CPU-heavy embedding off the main thread, making the event loop **more responsive** for streaming.
-
-### Implementation: Embedding Worker
-
-```javascript
-// services/embedding-worker.js — runs in a worker thread
-const { parentPort } = require("worker_threads");
-const { pipeline } = require("@xenova/transformers");
-
-let embedder;
-
-parentPort.on("message", async (text) => {
-  if (!embedder) {
-    embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
-  }
-  const output = await embedder(text, { pooling: "mean", normalize: true });
-  parentPort.postMessage(Array.from(output.data));
-});
+Upload 1 → fork() → new process (model load ~5s, 100MB, exit)
+Upload 2 → fork() → new process (model load ~5s, 100MB, exit)
+Upload 3 → fork() → new process (model load ~5s, 100MB, exit)
+                     3 processes × 100MB = 300MB, model loaded 3 times
 ```
 
-```javascript
-// services/embedding.js — main thread dispatches to worker
-const { Worker } = require("worker_threads");
-const worker = new Worker("./services/embedding-worker.js");
-
-function createEmbedding(text) {
-  return new Promise((resolve) => {
-    worker.once("message", resolve);
-    worker.postMessage(text);
-  });
-}
+**With process pool (current — implemented):**
+```
+Server start → pool.start() → pre-fork 3 workers (model loads once each)
+Upload 1 → pool.run() → Worker A (already warm, model cached) ✅
+Upload 2 → pool.run() → Worker B (already warm) ✅
+Upload 3 → pool.run() → Worker C (already warm) ✅
+Upload 4 → pool.run() → queued → dispatched when A/B/C finishes
 ```
 
-### When to Use Worker Threads
-
-| Scenario | Users | Need Workers? |
-|---|---|---|
-| Single user, small docs | 1 | No |
-| Few users, occasional uploads | 2-5 | Optional |
-| Many concurrent uploads | 5+ | **Yes** — embedding blocks the loop |
-| Many users asking questions | 10+ | **Yes** — query embedding blocks briefly |
-| Just streaming LLM responses | Any | No — pure I/O, never blocks |
+See [§13](#13-process-pool-architecture-implemented) for the full implementation details.
 
 ### Summary
 
 - **Streaming never blocks** — each `await` yields to the event loop
 - **10+ users can stream simultaneously** — it's all interleaved I/O
 - **`createEmbedding()` is the only real bottleneck** — ~50-200ms of CPU per call
-- **Worker threads fix the bottleneck** without affecting streaming
+- **Process pool fixes the bottleneck** — fixed memory, reused workers, no model reload
 - **No need for clustering** unless you exceed one CPU core's capacity for embeddings
+
+---
+
+## 13. Process Pool Architecture (Implemented)
+
+> **Status: ✅ Implemented** in `services/process-pool.js`, `services/process-worker.js`, `app.js`
+
+### Problem: Fork-per-Upload
+
+The original design called `fork()` for every upload. Each forked process:
+- Created its own Redis connection (wasteful multiplied connections)
+- Loaded the ~30MB ONNX embedding model from scratch (~1-5s init)
+- Allocated a full V8 heap (~50-100MB)
+- Exited after one job (all that setup thrown away)
+
+10 concurrent uploads → 10 processes → 1GB+ RAM, 10 Redis connections, 10 model loads.
+
+### Solution: Fixed-Size Process Pool
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Main Process (app.js)                                      │
+│                                                             │
+│  Express server ◄──── HTTP requests                         │
+│       │                                                     │
+│       ▼                                                     │
+│  ProcessPool ─── onMessage callback ──► Redis (1 connection)│
+│   │   │   │                                                 │
+│   IPC IPC IPC   (Node IPC channel, no network)              │
+│   │   │   │                                                 │
+├───┼───┼───┼─────────────────────────────────────────────────┤
+│   ▼   ▼   ▼                                                 │
+│  Worker Worker Worker   (pre-forked, long-lived)            │
+│  PID 1 PID 2  PID 3                                        │
+│                                                             │
+│  Each worker:                                               │
+│  • ONNX model loaded once, reused across all jobs           │
+│  • ZERO Redis connections                                   │
+│  • Communicates via IPC only                                │
+│  • Stays alive between jobs                                 │
+│  • Auto-respawned if it crashes                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Key Files
+
+| File | Role |
+|---|---|
+| `services/process-pool.js` | Pool manager — pre-forks workers, dispatches jobs, manages queue, auto-respawns crashed workers |
+| `services/process-worker.js` | Long-lived worker — handles document processing (extract → chunk → embed → insert), stays alive between jobs |
+| `app.js` | Creates pool at startup, routes IPC messages to Redis, dispatches uploads via `pool.run()` |
+
+### IPC Message Protocol
+
+All Redis operations are handled by the **main process only**. Workers have zero Redis connections.
+
+| Direction | Message | Purpose |
+|---|---|---|
+| Main → Worker | `{ type: 'start', uploadId, userId, fileName, totalChunks }` | Start processing a document |
+| Worker → Main | `{ type: 'status', uploadId, status: { stage, progress, total } }` | Update processing progress in Redis |
+| Worker → Main | `{ type: 'setDocId', uploadId, docId }` | Store document ID in Redis |
+| Worker → Main | `{ type: 'done' }` | Job complete — return worker to idle pool |
+| Worker → Main | `{ type: 'error', error }` | Job failed — return worker to idle pool |
+
+### Configuration
+
+| Env Variable | Default | Description |
+|---|---|---|
+| `WORKER_POOL_SIZE` | `os.cpus().length - 1` (min 1) | Number of pre-forked worker processes |
+
+### Resource Comparison
+
+| Metric | Fork-per-Upload (old) | Process Pool (current) |
+|---|---|---|
+| Processes for 10 uploads | 10 | Fixed (e.g. 3) |
+| Redis connections | 10 extra | 0 extra (main only) |
+| ONNX model loads | 10 times | 3 times (once per worker) |
+| Peak memory (10 uploads) | ~1GB+ | ~300MB (fixed) |
+| Excess upload handling | OOM risk | Queued, bounded |
+| Worker crash impact | Lost, no recovery | Auto-respawned |
+
+### Lifecycle
+
+1. **Server start** → `pool.start()` pre-forks N workers
+2. **Upload complete** → `pool.run(job)` dispatches to an idle worker (or queues if all busy)
+3. **Worker finishes** → returned to idle set, next queued job dispatched immediately
+4. **Worker crashes** → auto-respawned, pending job promise rejected
+5. **Server shutdown** → `pool.shutdown()` sends SIGTERM to all workers
+
+### Gotcha: Graceful Shutdown Hanging
+
+**Problem encountered:** After pressing Ctrl+C, the server printed `Shutting down…` and `[Pool] All workers terminated` repeatedly but never actually exited. The process was stuck.
+
+**Root causes:**
+
+1. **No re-entry guard** — `SIGINT` fires on every Ctrl+C press, so the shutdown handler ran multiple times in parallel.
+2. **`server.close()` doesn't force-exit** — it only stops accepting new connections. Existing connections (SSE streams, keep-alive) keep the event loop alive indefinitely.
+3. **Child process references** — even after `pool.shutdown()`, lingering process references can prevent Node.js from exiting.
+
+**Fix applied in `app.js`:**
+
+```javascript
+let shuttingDown = false;
+async function gracefulShutdown() {
+  if (shuttingDown) return;        // 1. Run only once
+  shuttingDown = true;
+  console.log("Shutting down…");
+  await pool.shutdown();
+  server.close(() => {
+    console.log("Server closed");
+    process.exit(0);               // 2. Explicitly exit when all connections drain
+  });
+  setTimeout(() => {
+    console.warn("Forcing exit (connections did not close in time)");
+    process.exit(1);               // 3. Force exit after 5s if connections hang
+  }, 5000);
+}
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", gracefulShutdown);
+```
+
+**Key takeaway:** Always call `process.exit()` in Node.js shutdown handlers — `server.close()` alone is not enough when you have SSE streams, keep-alive connections, or child process references.
+
+### Gotcha: Worker Respawn Loop on Windows (Ctrl+C)
+
+**Problem encountered:** On startup the pool spawned 15 workers (on a 16-core machine). When pressing Ctrl+C, the terminal flooded with repeating `[Pool] All workers terminated` / `Shutting down…` messages and never exited.
+
+**Root cause — Windows SIGINT process group behavior:**
+
+On Windows, Ctrl+C sends `SIGINT` to the **entire process group** (parent + all children) simultaneously. This means:
+
+```
+Ctrl+C pressed
+  → OS sends SIGINT to parent AND 15 children at the same time
+  → Children die immediately (exit handlers fire)
+  → Parent's SIGINT handler hasn't run yet → _shutdown is still false
+  → exit handlers see _shutdown === false → respawn new workers!
+  → New workers immediately receive the pending SIGINT → die → respawn
+  → Infinite crash-respawn loop
+  → Parent's SIGINT handler finally runs → calls pool.shutdown()
+  → But by now there are dozens of workers cycling through spawn/die
+```
+
+**Three fixes applied:**
+
+1. **Pool size capped at 4** — 15 workers was excessive. Document processing is mostly I/O (Qdrant HTTP, file reads), not CPU-bound enough to justify 15 processes. Each worker loads the ONNX model (~50-100MB), so 15 workers wasted ~1.5GB RAM.
+
+   ```javascript
+   // process-pool.js — constructor
+   this.size = Math.max(1, Math.min(size || Math.min(os.cpus().length - 1, 4), 4));
+   ```
+
+2. **Skip respawn when child was killed by a signal** — If the child exited due to a signal (`SIGINT`, `SIGTERM`), it wasn't a crash — don't respawn. Only respawn on unexpected exits (non-zero code, no signal).
+
+   ```javascript
+   // process-pool.js — on('exit') handler
+   child.on("exit", (code, signal) => {
+     // ...
+     if (!this._shutdown && !signal) {  // ← skip if killed by signal
+       this._spawnWorker();
+     }
+   });
+   ```
+
+3. **Set `_shutdown = true` synchronously before async shutdown** — Ensures any in-flight exit handlers see the flag immediately, even if they fire before `pool.shutdown()` resolves.
+
+   ```javascript
+   // app.js — gracefulShutdown()
+   pool._shutdown = true;   // stop respawn immediately (synchronous)
+   await pool.shutdown();   // then kill workers (async)
+   ```
+
+**Key takeaway:** On Windows, `SIGINT` is broadcast to the entire process group. Always guard child process respawn logic against signal-based exits, and set shutdown flags synchronously before any async cleanup.
+
+**Impact:** High — bounded memory, no model reload overhead, no connection sprawl, crash resilience.
 
 ---
 

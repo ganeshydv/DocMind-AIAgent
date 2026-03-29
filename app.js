@@ -2,8 +2,6 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
-const { fork } = require("child_process");
-const path = require("path")
 
 const { createEmbedding } = require("./services/embedding");
 const {
@@ -17,7 +15,32 @@ const {
   saveChunk,
   getUploadStatus,
   getProcessingStatus,
+  updateProcessingStatus,
 } = require("./services/upload");
+const redis = require("./services/redis");
+const ProcessPool = require("./services/process-pool");
+
+// ─── Process Pool (shared across all uploads) ──────────────────
+const pool = new ProcessPool({
+  size: parseInt(process.env.WORKER_POOL_SIZE) || undefined, // defaults to CPU cores - 1
+  onMessage: async (msg) => {
+    switch (msg.type) {
+      case "status":
+        await updateProcessingStatus(msg.uploadId, msg.status);
+        console.log(`[Pool] ${msg.uploadId} → ${msg.status.stage}`);
+        break;
+      case "setDocId":
+        await redis.hset(`upload:${msg.uploadId}`, "docId", msg.docId);
+        break;
+      case "done":
+        console.log(`[Pool] Job done`);
+        break;
+      case "error":
+        console.error(`[Pool] Job error: ${msg.error}`);
+        break;
+    }
+  },
+});
 
 const app = express();
 app.use(cors());
@@ -61,21 +84,19 @@ app.post("/upload/chunk/:uploadId/:chunkIndex", async (req, res) => {
 
       const status = await getUploadStatus(uploadId);
       if (status.complete) {
-        // Fork a child process for heavy processing (text extraction + embedding).
-        // Using fork() instead of Worker because @xenova/transformers native ONNX
-        // bindings crash the main process when a worker thread exits.
-        const child = fork(
-          path.join(__dirname, "services", "process-worker.js"),
-          [uploadId, status.userId],
-        );
-        child.on("message", (msg) => console.log(`[Process] ${msg.stage}`));
-        child.on("error", (err) =>
-          console.error("[Process] Error:", err.message),
-        );
-        child.on("exit", (code) =>
-          console.log(`[Process] Exited with code ${code}`),
-        );
-        child.unref();
+        // Dispatch to the process pool — reuses long-lived workers
+        // instead of forking a new process per upload.
+        pool
+          .run({
+            type: "start",
+            uploadId,
+            userId: status.userId,
+            fileName: status.fileName,
+            totalChunks: status.totalChunks,
+          })
+          .catch((err) =>
+            console.error(`[Pool] Upload ${uploadId} failed:`, err.message),
+          );
       }
       res.json({ received: true, chunkIndex: parseInt(chunkIndex) });
     });
@@ -251,4 +272,29 @@ app.post("/ask", async (req, res) => {
   }
 });
 
-app.listen(3000, () => console.log("Server running on port 3000"));
+// ─── Start server + process pool ───────────────────────────────
+
+pool.start(); // pre-fork worker processes
+
+const server = app.listen(3000, () => console.log("Server running on port 3000"));
+
+// Graceful shutdown — kill pool workers when the server stops
+let shuttingDown = false;
+async function gracefulShutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log("Shutting down…");
+  pool._shutdown = true; // stop respawn immediately (before async shutdown kills workers)
+  await pool.shutdown();
+  server.close(() => {
+    console.log("Server closed");
+    process.exit(0);
+  });
+  // Force exit if server.close() hangs (e.g. open SSE connections)
+  setTimeout(() => {
+    console.warn("Forcing exit (connections did not close in time)");
+    process.exit(1);
+  }, 5000);
+}
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", gracefulShutdown);
